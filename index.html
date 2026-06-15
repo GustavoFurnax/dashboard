@@ -558,47 +558,87 @@ async function loadSheet(showLoading = false) {
 
 // ── CSV Parser ─────────────────────────────────────────
 // Google Sheets gviz CSV exports dates as M/D/YYYY
+
 function parseCSV(text) {
   const DAY_LABELS = new Set(['SEGUNDA','TERCA','QUARTA','QUINTA','SEXTA','SABADO','DOMINGO']);
   const AUSENCIA   = new Set(['FERIAS','ATESTADO','BANCO DE HORAS','INICIO']);
+  const TIPOS      = new Set(['INSTALACAO','ASSISTENCIA TECNICA','GARANTIA','SERVICOS INTERNOS','CORTESIA']);
   const norm = s => (s||'').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
 
-  return text.trim().split('\n').reduce((acc, line) => {
-    const c = csvLine(line);
-    const tecnico = strip(c[0]);
-    const dateRaw = strip(c[1]);
-    if (!tecnico || !dateRaw || DAY_LABELS.has(norm(tecnico))) return acc;
+  const lines = text.trim().split('\n').map(csvLine);
+  if (lines.length < 2) return [];
 
-    // M/D/YYYY (Google Sheets) → get the day part
-    // If first number > 12 it's D/M/YYYY (BR), else M/D/YYYY (US)
-    let dia = null;
-    let m = dateRaw.match(/^(\d{1,2})\/(\d{1,2})\/\d{4}$/);
-    if (m) dia = +m[1] > 12 ? +m[1] : +m[2];
-    if (!dia) { m = dateRaw.match(/\d{4}-\d{2}-(\d{2})/); if (m) dia = +m[1]; }
-    if (!dia) return acc;
+  // Step 1: auto-detect column positions by scanning first real data rows
+  let colDate = -1, colLocal = -1, colTipo = -1, colEquip = -1, colOS = -1;
 
-    const local = strip(c[2]);
-    const tipo  = strip(c[3]);
-    const equip = strip(c[4]);
-    const os    = strip(c[6]);
+  for (let i = 0; i < Math.min(60, lines.length); i++) {
+    const row = lines[i];
+    const tecnico = (row[0]||'').trim();
+    if (!tecnico || DAY_LABELS.has(norm(tecnico))) continue;
+
+    // Find date column
+    if (colDate < 0) {
+      for (let c = 1; c < Math.min(row.length, 12); c++) {
+        if (extractDay((row[c]||'').trim())) { colDate = c; break; }
+      }
+    }
+
+    // Find tipo column (has a known service type value)
+    if (colDate >= 0 && colTipo < 0) {
+      for (let c = colDate + 1; c < Math.min(row.length, 20); c++) {
+        if (TIPOS.has(norm(row[c]||'')) || (row[c]||'').trim() === '.') {
+          colTipo  = c;
+          colLocal = colDate + 1;  // local is right after date
+          colEquip = colTipo + 1;
+          colOS    = colTipo + 3;
+          break;
+        }
+      }
+    }
+    if (colDate >= 0 && colTipo >= 0) break;
+  }
+
+  // Fallback to expected positions if detection failed
+  if (colDate < 0)  colDate  = 1;
+  if (colTipo < 0)  { colLocal = 2; colTipo = 3; colEquip = 4; colOS = 6; }
+
+  console.log('[TechOps] Columns → date:'+colDate+' local:'+colLocal+' tipo:'+colTipo+' equip:'+colEquip+' os:'+colOS);
+
+  // Step 2: parse all rows, carrying forward date across merged cells
+  const records = [];
+  let lastDia = null;
+
+  for (const row of lines) {
+    const tecnico = (row[0]||'').trim();
+    if (!tecnico || DAY_LABELS.has(norm(tecnico))) continue;
+
+    const rawDate = (row[colDate]||'').trim();
+    if (rawDate) { const d = extractDay(rawDate); if (d) lastDia = d; }
+    if (!lastDia) continue;
+
+    const local = (row[colLocal]||'').trim();
+    const tipo  = (row[colTipo]||'').trim();
+    const equip = (row[colEquip]||'').trim();
+    const os    = colOS < row.length ? (row[colOS]||'').trim() : '';
 
     const ausencia = tipo === '.' || AUSENCIA.has(norm(equip)) || AUSENCIA.has(norm(local));
-    acc.push({ tecnico, dia, local, tipo, equip, os, ausencia });
-    return acc;
-  }, []);
+    records.push({ tecnico, dia: lastDia, local, tipo, equip, os, ausencia });
+  }
+
+  console.log('[TechOps] Parsed', records.length, 'records. Sample:', JSON.stringify(records[0]));
+  return records;
 }
 
-function csvLine(line) {
-  const r = []; let cur = '', q = false;
-  for (const ch of line) {
-    if (ch === '"') { q = !q; }
-    else if (ch === ',' && !q) { r.push(cur); cur = ''; }
-    else cur += ch;
-  }
-  r.push(cur);
-  return r;
+function extractDay(s) {
+  if (!s) return null;
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})(\/\d+)?$/);
+  if (m) return +m[1] > 12 ? +m[1] : +m[2];
+  m = s.match(/\d{4}-\d{2}-(\d{2})/);
+  if (m) return +m[1];
+  return null;
 }
-const strip = s => (s||'').replace(/^"|"$/g,'').trim();
+
+
 
 // ── After data loads ───────────────────────────────────
 function onDataLoaded() {
